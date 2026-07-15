@@ -1,0 +1,26 @@
+{
+  "GRADLE_SDK_ERROR": {
+    "file": "gradle/build.gradle.template",
+    "telegramMsgId": 101
+  },
+  "MISSING_PLUGIN_ERROR": {
+    "file": "plugins/plugin-list.json",
+    "telegramMsgId": 102
+  },
+  "MANIFEST_ERROR": {
+    "file": "manifest_android/AndroidManifest.template.xml",
+    "telegramMsgId": 103
+  },
+  "RESOURCE_ERROR": {
+    "file": null,
+    "telegramMsgId": 104
+  },
+  "SDK_MISMATCH_ERROR": {
+    "file": "sdk/sdk-config.json",
+    "telegramMsgId": 105
+  },
+  "DEPENDENCY_ERROR": {
+    "file": "pubspec/pubspec.template.yaml",
+    "telegramMsgId": 106
+  }
+}
