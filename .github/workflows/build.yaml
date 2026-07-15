@@ -1,0 +1,357 @@
+name: Build Flutter APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL download ZIP project Flutter"
+        required: true
+      tag:
+        description: "Tag build"
+        required: true
+      build_type:
+        description: "debug / release"
+        required: true
+        default: "release"
+      only_analyze:
+        description: "Hanya jalankan analyze (true/false)"
+        required: false
+        default: "false"
+      auto_fix:
+        description: "Aktifkan Auto-Fix Builder (true/false)"
+        required: false
+        default: "false"
+      fix_category:
+        description: "Kategori error (dari autofix.js)"
+        required: false
+        default: ""
+      template_url:
+        description: "Raw GitHub URL template fix"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Download ZIP project
+        run: |
+          AUTO_FIX="${{ github.event.inputs.auto_fix }}"
+          URL="${{ github.event.inputs.zip_url }}"
+          UA_LIST=("FlutterBuildBot/1.0" "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" "curl/8.0")
+          SUCCESS=false
+
+          if [ "$AUTO_FIX" = "true" ]; then
+            MAX_TRY=3
+          else
+            MAX_TRY=1
+          fi
+
+          for i in $(seq 1 $MAX_TRY); do
+            UA="${UA_LIST[$((i-1))]}"
+            echo "=== [AUTO-FIX] Percobaan $i/$MAX_TRY — User-Agent: $UA ==="
+
+            EXTRA_FLAGS=""
+            if [ "$AUTO_FIX" = "true" ] && [ "$i" -gt 1 ]; then
+              echo "⚠️ [AUTO-FIX] Percobaan sebelumnya gagal, tambahkan --insecure"
+              EXTRA_FLAGS="-k"
+            fi
+
+            HTTP_CODE=$(curl -L $EXTRA_FLAGS \
+              -A "$UA" \
+              -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
+              -H "Accept: application/octet-stream" \
+              "$URL" \
+              -o project.zip \
+              -w "%{http_code}" \
+              --connect-timeout 15 --max-time 90 || echo "000")
+
+            echo "HTTP Status: $HTTP_CODE"
+
+            if [ "$HTTP_CODE" = "200" ] && file project.zip | grep -qi "zip"; then
+              SUCCESS=true
+              echo "✅ Download berhasil pada percobaan $i"
+              break
+            fi
+
+            echo "❌ Percobaan $i gagal (HTTP $HTTP_CODE), coba lagi..."
+            sleep 2
+          done
+
+          if [ "$SUCCESS" != "true" ]; then
+            echo "❌ Semua percobaan download gagal."
+            exit 1
+          fi
+
+      - name: Extract ZIP
+        run: |
+          if ! unzip -t project.zip > /dev/null 2>&1; then
+            echo "❌ File bukan ZIP valid!"
+            exit 1
+          fi
+          unzip -q project.zip -d project_raw
+
+          SUB_DIR_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type d | wc -l)
+          FILE_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type f | wc -l)
+          
+          if [ "$SUB_DIR_COUNT" -eq 1 ] && [ "$FILE_COUNT" -eq 0 ]; then
+            PROJECT_DIR=$(find project_raw -maxdepth 1 -mindepth 1 -type d | head -n 1)
+          else
+            PROJECT_DIR="project_raw"
+          fi
+          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@main
+        with:
+          flutter-version: "3.41.9"
+          channel: "stable"
+          cache: true
+
+      - name: "Auto-Fix: Manifest & Resource Check"
+        if: ${{ github.event.inputs.auto_fix == 'true' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          echo "=== [AUTO-FIX] Cek AndroidManifest.xml ==="
+          MANIFEST_PATH="android/app/src/main/AndroidManifest.xml"
+          FIX_CATEGORY="${{ github.event.inputs.fix_category }}"
+          TEMPLATE_URL="${{ github.event.inputs.template_url }}"
+
+          if [ -f "$MANIFEST_PATH" ]; then
+            if ! xmllint --noout "$MANIFEST_PATH" 2>/tmp/manifest_err.txt; then
+              echo "❌ Manifest tidak valid."
+              PKG_NAME=$(grep -o 'package="[^"]*"' "$MANIFEST_PATH" 2>/dev/null | head -1 | sed 's/package="//;s/"//')
+              if [ -z "$PKG_NAME" ]; then PKG_NAME="com.example.app"; fi
+
+              if [ "$FIX_CATEGORY" = "MANIFEST_ERROR" ] && [ -n "$TEMPLATE_URL" ]; then
+                echo "🔧 Ambil template dari GitHub: $TEMPLATE_URL"
+                if curl -fsSL "$TEMPLATE_URL" -o /tmp/manifest_template.xml && [ -s /tmp/manifest_template.xml ]; then
+                  sed "s/{{PACKAGE_NAME}}/$PKG_NAME/g" /tmp/manifest_template.xml > "$MANIFEST_PATH"
+                  echo "✅ AndroidManifest.xml diganti dari template."
+                fi
+              fi
+
+              if [ "$FIX_CATEGORY" != "MANIFEST_ERROR" ] || [ -z "$TEMPLATE_URL" ]; then
+                cat > "$MANIFEST_PATH" << MANIFEST_EOF
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="$PKG_NAME">
+              <application
+                  android:label="app"
+                  android:icon="@mipmap/ic_launcher">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <meta-data android:name="flutterEmbedding" android:value="2"/>
+              </application>
+          </manifest>
+          MANIFEST_EOF
+                echo "✅ AndroidManifest.xml di-regenerate (fallback)."
+              fi
+            else
+              echo "✅ Manifest valid."
+            fi
+          fi
+
+          echo ""
+          echo "=== [AUTO-FIX] Cek Resource yang hilang ==="
+          if [ -f "pubspec.yaml" ]; then
+            PLACEHOLDER_PNG_B64="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+            SYS_FONT=$(find /usr/share/fonts -name "*.ttf" 2>/dev/null | head -1)
+
+            grep -E '^\\s+- ' pubspec.yaml | sed -E 's/^\\s+-\\s*//; s/\\s*#.*//' | while read -r ASSET_PATH; do
+              if [ -z "$ASSET_PATH" ] || [ -f "$ASSET_PATH" ]; then continue; fi
+              case "$ASSET_PATH" in
+                *.png|*.jpg|*.jpeg|*.webp)
+                  mkdir -p "$(dirname "$ASSET_PATH")"
+                  echo "$PLACEHOLDER_PNG_B64" | base64 -d > "$ASSET_PATH"
+                  echo "🖼️ Placeholder gambar dibuat: $ASSET_PATH"
+                  ;;
+                *.ttf|*.otf)
+                  mkdir -p "$(dirname "$ASSET_PATH")"
+                  if [ -n "$SYS_FONT" ]; then
+                    cp "$SYS_FONT" "$ASSET_PATH"
+                  else
+                    touch "$ASSET_PATH"
+                  fi
+                  echo "🔤 Placeholder font dibuat: $ASSET_PATH"
+                  ;;
+                *.svg)
+                  mkdir -p "$(dirname "$ASSET_PATH")"
+                  echo '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>' > "$ASSET_PATH"
+                  echo "🖼️ Placeholder SVG dibuat: $ASSET_PATH"
+                  ;;
+              esac
+            done
+          fi
+
+      - name: Analyze Project Code
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ -f "pubspec.yaml" ]; then
+            flutter analyze > analyze_report.txt 2>&1 || true
+            echo "[RESULT_ANALYZE]"
+            cat analyze_report.txt
+            echo "[END_RESULT_ANALYZE]"
+            rm -f analyze_report.txt
+          fi
+
+      - name: Stop if Analyze Only
+        if: ${{ github.event.inputs.only_analyze == 'true' }}
+        run: exit 1
+
+      - name: Get dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ -f "pubspec.yaml" ]; then
+            if timeout 120s flutter pub get 2>pub_get_err.txt; then
+              echo "✅ pub get sukses."
+            else
+              cat pub_get_err.txt
+              if [ "${{ github.event.inputs.auto_fix }}" = "true" ]; then
+                echo "⚠️ [AUTO-FIX] pub get gagal."
+                if [ "${{ github.event.inputs.fix_category }}" = "DEPENDENCY_ERROR" ] && [ -n "${{ github.event.inputs.template_url }}" ]; then
+                  echo "🔧 Ambil template pubspec.yaml dari GitHub"
+                  curl -fsSL "${{ github.event.inputs.template_url }}" -o /tmp/pubspec.template.yaml
+                  if [ -s /tmp/pubspec.template.yaml ]; then
+                    cp pubspec.yaml pubspec.yaml.bak
+                    cp /tmp/pubspec.template.yaml pubspec.yaml
+                    echo "✅ pubspec.yaml diganti dari template."
+                  fi
+                fi
+                echo "🔧 Mencoba 'flutter pub upgrade --major-versions'..."
+                timeout 150s flutter pub upgrade --major-versions || {
+                  rm -f pubspec.lock
+                  timeout 120s flutter pub get || echo "⚠️ Tetap gagal."
+                }
+              fi
+            fi
+          fi
+
+      - name: "Auto-Fix: Gradle/AGP/Kotlin Patch"
+        if: ${{ github.event.inputs.auto_fix == 'true' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          echo "=== [AUTO-FIX] Patch Gradle/AGP/Kotlin ==="
+          FIX_CATEGORY="${{ github.event.inputs.fix_category }}"
+          TEMPLATE_URL="${{ github.event.inputs.template_url }}"
+
+          if [ "$FIX_CATEGORY" = "GRADLE_SDK_ERROR" ] && [ -n "$TEMPLATE_URL" ] && [ -f "android/app/build.gradle" ]; then
+            echo "🔧 Ambil template build.gradle dari GitHub"
+            curl -fsSL "$TEMPLATE_URL" -o /tmp/build.gradle.template
+            if [ -s /tmp/build.gradle.template ]; then
+              cp android/app/build.gradle android/app/build.gradle.bak
+              cp /tmp/build.gradle.template android/app/build.gradle
+              echo "✅ build.gradle diganti dari template."
+            fi
+          fi
+
+          WRAPPER_PROPS="android/gradle/wrapper/gradle-wrapper.properties"
+          if [ -f "$WRAPPER_PROPS" ]; then
+            sed -i -E 's|distributionUrl=.*|distributionUrl=https\\://services.gradle.org/distributions/gradle-8.9-all.zip|' "$WRAPPER_PROPS"
+            echo "✅ gradle-wrapper.properties dipatch ke Gradle 8.9"
+          fi
+
+          for F in "android/settings.gradle" "android/settings.gradle.kts"; do
+            if [ -f "$F" ]; then
+              sed -i -E "s/(com\\.android\\.(application|library)['\\\"]? version ['\\\"])[0-9.]+/\\18.6.0/" "$F"
+              sed -i -E "s/(org\\.jetbrains\\.kotlin\\.android['\\\"]? version ['\\\"])[0-9.]+/\\12.1.0/" "$F"
+              echo "✅ AGP/Kotlin dipatch di $F"
+            fi
+          done
+
+      - name: "Auto-Fix: Missing Plugin"
+        if: ${{ github.event.inputs.auto_fix == 'true' && github.event.inputs.fix_category == 'MISSING_PLUGIN_ERROR' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          TEMPLATE_URL="${{ github.event.inputs.template_url }}"
+          if [ -z "$TEMPLATE_URL" ]; then exit 0; fi
+          curl -fsSL "$TEMPLATE_URL" -o /tmp/plugin-list.json || exit 0
+          node -e '
+            const fs = require("fs");
+            const list = JSON.parse(fs.readFileSync("/tmp/plugin-list.json", "utf-8"));
+            let pubspec = fs.readFileSync("pubspec.yaml", "utf-8");
+            const depsMarker = "dependencies:";
+            const idx = pubspec.indexOf(depsMarker);
+            if (idx === -1) process.exit(0);
+            let added = [];
+            for (const p of list) {
+              if (!p || !p.name) continue;
+              if (!new RegExp("^\\\\s*" + p.name + "\\\\s*:", "m").test(pubspec)) {
+                added.push(p);
+              }
+            }
+            if (added.length === 0) process.exit(0);
+            const lines = added.map(p => "\\n  " + p.name + ": " + (p.version || "any")).join("");
+            pubspec = pubspec.slice(0, idx + depsMarker.length) + lines + pubspec.slice(idx + depsMarker.length);
+            fs.writeFileSync("pubspec.yaml", pubspec);
+            console.log("✅ Plugin ditambahkan: " + added.map(p => p.name).join(", "));
+          '
+
+      - name: "Auto-Fix: SDK Mismatch"
+        if: ${{ github.event.inputs.auto_fix == 'true' && github.event.inputs.fix_category == 'SDK_MISMATCH_ERROR' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          TEMPLATE_URL="${{ github.event.inputs.template_url }}"
+          if [ -z "$TEMPLATE_URL" ]; then exit 0; fi
+          curl -fsSL "$TEMPLATE_URL" -o /tmp/sdk-config.json || exit 0
+          GRADLE_FILE="android/app/build.gradle"
+          if [ -f "$GRADLE_FILE" ]; then
+            COMPILE_SDK=$(node -pe "JSON.parse(require('fs').readFileSync('/tmp/sdk-config.json','utf-8')).compileSdk")
+            MIN_SDK=$(node -pe "JSON.parse(require('fs').readFileSync('/tmp/sdk-config.json','utf-8')).minSdk")
+            TARGET_SDK=$(node -pe "JSON.parse(require('fs').readFileSync('/tmp/sdk-config.json','utf-8')).targetSdk")
+            sed -i -E "s/(compileSdk(Version)? )[0-9]+/\\1$COMPILE_SDK/" "$GRADLE_FILE"
+            sed -i -E "s/(minSdk(Version)? )[0-9]+/\\1$MIN_SDK/" "$GRADLE_FILE"
+            sed -i -E "s/(targetSdk(Version)? )[0-9]+/\\1$TARGET_SDK/" "$GRADLE_FILE"
+            echo "✅ SDK config diterapkan."
+          fi
+
+      - name: Build APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ -f "pubspec.yaml" ]; then
+            flutter build apk --${{ github.event.inputs.build_type }}
+          else
+            GRADLE_PATH=$(find . -name "gradlew" | head -n 1)
+            GRADLE_DIR=$(dirname "$GRADLE_PATH")
+            cd "$GRADLE_DIR" && chmod +x gradlew
+            if [ "${{ github.event.inputs.build_type }}" = "debug" ]; then
+              ./gradlew assembleDebug
+            else
+              ./gradlew assembleRelease
+            fi
+          fi
+
+      - name: Check APK Output
+        run: |
+          APK_FOUND=$(find $GITHUB_WORKSPACE -name "*.apk" | head -n 1)
+          APK_PATH=$(echo "$APK_FOUND" | sed "s|$GITHUB_WORKSPACE/||")
+          echo "PROJECT_DIR=$GITHUB_WORKSPACE" >> $GITHUB_ENV
+          echo "APK_PATH=$APK_PATH" >> $GITHUB_ENV
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-${{ github.event.inputs.build_type }}-${{ github.event.inputs.tag }}
+          path: ${{ env.PROJECT_DIR }}/${{ env.APK_PATH }}
+          retention-days: 1
+          if-no-files-found: error
