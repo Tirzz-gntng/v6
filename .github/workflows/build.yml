@@ -29,6 +29,10 @@ on:
         description: "Raw GitHub URL template fix yang sudah divalidasi (lihat templates.js), kosong = pakai fallback bawaan"
         required: false
         default: ""
+      final_attempt:
+        description: "Percobaan Auto-Fix terakhir (true/false) — memicu Hotfix Darurat (Tahap 4)"
+        required: false
+        default: "false"
 
 jobs:
   build:
@@ -292,6 +296,27 @@ jobs:
             rm -f pub_get_err.txt pub_upgrade_err.txt
           fi
 
+      - name: "Auto-Fix: Dart Code Check"
+        if: ${{ github.event.inputs.auto_fix == 'true' && github.event.inputs.fix_category == 'DART_CODE_ERROR' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          echo "=== [AUTO-FIX] Perbaikan kode Dart (aman, tanpa ubah logic bisnis) ==="
+          if [ -f "pubspec.yaml" ]; then
+            echo "🔧 Menjalankan 'dart fix --apply' (unused import, lint auto-fixable)..."
+            dart fix --apply 2>/tmp/dart_fix_err.txt || cat /tmp/dart_fix_err.txt || true
+
+            if [ -f "lib/main.dart" ]; then
+              if ! grep -q "runApp(" lib/main.dart; then
+                echo "⚠️ lib/main.dart tidak memanggil runApp(), kemungkinan struktur rusak — dibiarkan untuk pengecekan manual."
+              else
+                echo "✅ lib/main.dart terlihat standar (runApp ditemukan)."
+              fi
+            fi
+            echo "✅ [AUTO-FIX] Dart code check selesai (best-effort)."
+          else
+            echo "ℹ️ pubspec.yaml tidak ditemukan, skip."
+          fi
+
       - name: "Auto-Fix: Gradle/AGP/Kotlin Compatibility Patch"
         if: ${{ github.event.inputs.auto_fix == 'true' }}
         working-directory: ${{ env.PROJECT_DIR }}
@@ -345,6 +370,49 @@ jobs:
           fi
 
           echo "✅ [AUTO-FIX] Patch kompatibilitas selesai."
+
+      - name: "Auto-Fix: Hotfix Darurat (Percobaan Terakhir)"
+        if: ${{ github.event.inputs.auto_fix == 'true' && github.event.inputs.final_attempt == 'true' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          echo "=== [AUTO-FIX] Hotfix Darurat — percobaan terakhir, maksimalkan peluang build sukses ==="
+          APP_GRADLE="android/app/build.gradle"
+          MANIFEST_PATH="android/app/src/main/AndroidManifest.xml"
+          GRADLE_PROPS="android/gradle.properties"
+
+          if [ -f "$APP_GRADLE" ]; then
+            if ! grep -q "multiDexEnabled" "$APP_GRADLE"; then
+              sed -i -E '/defaultConfig\s*\{/a\        multiDexEnabled true' "$APP_GRADLE"
+              echo "✅ multiDexEnabled true ditambahkan (cegah duplicate classes)."
+            fi
+            sed -i -E 's/minifyEnabled\s+true/minifyEnabled false/' "$APP_GRADLE"
+            sed -i -E 's/shrinkResources\s+true/shrinkResources false/' "$APP_GRADLE"
+            echo "✅ minifyEnabled/shrinkResources dipaksa false (hindari error obfuscation R8/ProGuard)."
+          fi
+
+          if [ -f "$GRADLE_PROPS" ]; then
+            if ! grep -q "android.enableJetifier" "$GRADLE_PROPS"; then
+              echo "android.enableJetifier=true" >> "$GRADLE_PROPS"
+            fi
+            if ! grep -q "android.useAndroidX" "$GRADLE_PROPS"; then
+              echo "android.useAndroidX=true" >> "$GRADLE_PROPS"
+            fi
+            echo "✅ AndroidX/Jetifier dipastikan aktif di gradle.properties."
+          fi
+
+          if [ -f "$MANIFEST_PATH" ]; then
+            if ! grep -q "android.permission.INTERNET" "$MANIFEST_PATH"; then
+              sed -i -E "s#<manifest ([^>]*)>#<manifest \1><uses-permission android:name=\"android.permission.INTERNET\"/>#" "$MANIFEST_PATH"
+              echo "✅ Izin INTERNET ditambahkan ke AndroidManifest.xml."
+            fi
+            if grep -q 'android:name=".MainActivity"' "$MANIFEST_PATH" && ! grep -q 'android:exported="true"' "$MANIFEST_PATH"; then
+              sed -i -E 's#(android:name="\.MainActivity")#\1 android:exported="true"#' "$MANIFEST_PATH"
+              echo "✅ android:exported=\"true\" dipastikan pada MainActivity (wajib utk API 31+)."
+            fi
+            echo "✅ Manifest dicek untuk izin & exported."
+          fi
+
+          echo "ℹ️ Ini adalah percobaan terakhir — jika build masih gagal setelah ini, laporan akan dikirim ke user beserta build_error.log."
 
       - name: "Auto-Fix: Missing Plugin Check"
         if: ${{ github.event.inputs.auto_fix == 'true' && github.event.inputs.fix_category == 'MISSING_PLUGIN_ERROR' }}
